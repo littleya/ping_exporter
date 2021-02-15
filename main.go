@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+    "io/ioutil"
 	"net"
 	"net/http"
+    "net/url"
 	"os"
 	"strings"
 	"time"
@@ -22,24 +24,28 @@ import (
 const version string = "0.4.5"
 
 var (
-	showVersion   = kingpin.Flag("version", "Print version information").Default().Bool()
-	listenAddress = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface").Default(":9427").String()
-	metricsPath   = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics").Default("/metrics").String()
-	configFile    = kingpin.Flag("config.path", "Path to config file").Default("").String()
-	pingInterval  = kingpin.Flag("ping.interval", "Interval for ICMP echo requests").Default("5s").Duration()
-	pingTimeout   = kingpin.Flag("ping.timeout", "Timeout for ICMP echo request").Default("4s").Duration()
-	pingSize      = kingpin.Flag("ping.size", "Payload size for ICMP echo requests").Default("56").Uint16()
-	historySize   = kingpin.Flag("ping.history-size", "Number of results to remember per target").Default("10").Int()
-	dnsRefresh    = kingpin.Flag("dns.refresh", "Interval for refreshing DNS records and updating targets accordingly (0 if disabled)").Default("1m").Duration()
-	dnsNameServer = kingpin.Flag("dns.nameserver", "DNS server used to resolve hostname of targets").Default("").String()
-	logLevel      = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Default("info").String()
-	targets       = kingpin.Arg("targets", "A list of targets to ping").Strings()
+	showVersion          = kingpin.Flag("version", "Print version information").Default().Bool()
+	listenAddress        = kingpin.Flag("web.listen-address", "Address on which to expose metrics and web interface").Default(":9427").String()
+	metricsPath          = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics").Default("/metrics").String()
+	configFile           = kingpin.Flag("config.path", "Path to config file").Default("").String()
+	pingInterval         = kingpin.Flag("ping.interval", "Interval for ICMP echo requests").Default("5s").Duration()
+	pingTimeout          = kingpin.Flag("ping.timeout", "Timeout for ICMP echo request").Default("4s").Duration()
+	pingSize             = kingpin.Flag("ping.size", "Payload size for ICMP echo requests").Default("56").Uint16()
+	historySize          = kingpin.Flag("ping.history-size", "Number of results to remember per target").Default("10").Int()
+	dnsRefresh           = kingpin.Flag("dns.refresh", "Interval for refreshing DNS records and updating targets accordingly (0 if disabled)").Default("1m").Duration()
+	dnsNameServer        = kingpin.Flag("dns.nameserver", "DNS server used to resolve hostname of targets").Default("").String()
+	logLevel             = kingpin.Flag("log.level", "Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal]").Default("info").String()
+	targets              = kingpin.Arg("targets", "A list of targets to ping").Strings()
+	remoteTargets        = kingpin.Flag("remote-targets", "A list of remote targets url").Strings()
+	updateRemoteInterval = kingpin.Flag("update-remote-interval", "Interval for update remote targets").Default("30s").Duration()
 )
 
 var (
 	enableDeprecatedMetrics = true // default may change in future
 	deprecatedMetrics       = kingpin.Flag("metrics.deprecated", "Enable or disable deprecated metrics (`ping_rtt_ms{type=best|worst|mean|std_dev}`). Valid choices: [enable, disable]").Default("enable").String()
 )
+
+var allTargets []*target
 
 func init() {
 	kingpin.Parse()
@@ -110,9 +116,9 @@ func printVersion() {
 
 func startMonitor(cfg *config.Config) (*mon.Monitor, error) {
 	resolver := setupResolver(cfg)
-	var bind4,bind6 string
+	var bind4, bind6 string
 	if ln, err := net.Listen("tcp4", "127.0.0.1:0"); err == nil {
-                //ipv4 enabled
+		//ipv4 enabled
 		ln.Close()
 		bind4 = "0.0.0.0"
 	}
@@ -135,7 +141,11 @@ func startMonitor(cfg *config.Config) (*mon.Monitor, error) {
 		cfg.Ping.Timeout.Duration())
 	monitor.HistorySize = cfg.Ping.History
 
-	targets := make([]*target, len(cfg.Targets))
+    remoteTargets := fetchRemoteTargets(cfg)
+    cfg.Targets = append(cfg.Targets, remoteTargets...)
+
+	// targets := make([]*target, len(cfg.Targets))
+    allTargets = make([]*target, len(cfg.Targets))
 	for i, host := range cfg.Targets {
 		t := &target{
 			host:      host,
@@ -143,7 +153,7 @@ func startMonitor(cfg *config.Config) (*mon.Monitor, error) {
 			delay:     time.Duration(10*i) * time.Millisecond,
 			resolver:  resolver,
 		}
-		targets[i] = t
+		allTargets[i] = t
 
 		err := t.addOrUpdateMonitor(monitor)
 		if err != nil {
@@ -151,24 +161,25 @@ func startMonitor(cfg *config.Config) (*mon.Monitor, error) {
 		}
 	}
 
-	go startDNSAutoRefresh(cfg.DNS.Refresh.Duration(), targets, monitor)
+    go syncRemoteTargets(cfg)
+	go startDNSAutoRefresh(cfg.DNS.Refresh.Duration(), monitor, cfg)
 
 	return monitor, nil
 }
 
-func startDNSAutoRefresh(interval time.Duration, targets []*target, monitor *mon.Monitor) {
+func startDNSAutoRefresh(interval time.Duration, monitor *mon.Monitor, cfg *config.Config) {
 	if interval <= 0 {
 		return
 	}
 
 	for range time.NewTicker(interval).C {
-		refreshDNS(targets, monitor)
+		refreshDNS(monitor, cfg)
 	}
 }
 
-func refreshDNS(targets []*target, monitor *mon.Monitor) {
+func refreshDNS(monitor *mon.Monitor, cfg *config.Config) {
 	log.Infoln("refreshing DNS")
-	for _, t := range targets {
+	for _, t := range allTargets {
 		go func(ta *target) {
 			err := ta.addOrUpdateMonitor(monitor)
 			if err != nil {
@@ -176,6 +187,76 @@ func refreshDNS(targets []*target, monitor *mon.Monitor) {
 			}
 		}(t)
 	}
+}
+
+func syncRemoteTargets(cfg *config.Config) {
+    for {
+        resolver := setupResolver(cfg)
+        remoteTargets := fetchRemoteTargets(cfg)
+        // Append targets
+        for _, host := range remoteTargets {
+            if checkIsInTarget(allTargets, host) {
+                 continue
+            }
+            t := &target{
+                host: host,
+                addresses: make([]net.IPAddr, 0),
+                resolver: resolver,
+            }
+            allTargets = append(allTargets, t)
+        }
+        // Format delay
+        for i, t := range allTargets {
+            t.delay = time.Duration(10 * i) * time.Millisecond
+        }
+        time.Sleep(cfg.UpdateRemoteInterval.Duration() * time.Second)
+    }
+}
+
+func checkIsInTarget(targets []*target, host string) bool {
+    for _, t := range targets {
+        if t.host == host{
+            return true
+        }
+    }
+
+    return false
+}
+
+func fetchRemoteTargets(cfg *config.Config) []string {
+    client := &http.Client{}
+    remoteTargets := []string{}
+    for _, uri := range cfg.RemoteTargets {
+        u, err := url.Parse(uri)
+        if err != nil {
+            continue
+        }
+        if u.Scheme != "http" && u.Scheme != "https" {
+            continue
+        }
+
+        req, err := http.NewRequest("GET", uri, nil)
+        if u.User != nil {
+            passwd, _ := u.User.Password()
+            req.SetBasicAuth(u.User.Username(), passwd)
+        }
+        resp, err := client.Do(req)
+        if err != nil {
+            continue
+        }
+        body, err := ioutil.ReadAll(resp.Body)
+        for _, t := range strings.Split(string(body), "\n") {
+            if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, "//"){
+                continue
+            }
+            // _, err := net.LookupIP(t)
+            // if err != nil {
+            //     continue
+            // }
+            remoteTargets = append(remoteTargets, t)
+        }
+    }
+    return remoteTargets
 }
 
 func startServer(monitor *mon.Monitor) {
@@ -253,6 +334,13 @@ func addFlagToConfig(cfg *config.Config) {
 	}
 	if cfg.DNS.Nameserver == "" {
 		cfg.DNS.Nameserver = *dnsNameServer
+	}
+	if len(cfg.RemoteTargets) == 0 {
+		cfg.RemoteTargets = *remoteTargets
+	}
+	if cfg.UpdateRemoteInterval == 0 {
+        cfg.UpdateRemoteInterval.Set(*pingInterval)
+
 	}
 }
 

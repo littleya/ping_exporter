@@ -25,7 +25,7 @@ func (t *target) addOrUpdateMonitor(monitor *mon.Monitor) error {
 
 	addrs, err := t.resolver.LookupIPAddr(context.Background(), t.host)
 	if err != nil {
-		return fmt.Errorf("error resolving target: %v", err)
+		return fmt.Errorf("error resolving target %s: %v", t.host, err)
 	}
 
 	for _, addr := range addrs {

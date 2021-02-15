@@ -11,6 +11,10 @@ import (
 type Config struct {
 	Targets []string `yaml:"targets"`
 
+	RemoteTargets []string `yaml:"remote-targets"`
+
+	UpdateRemoteInterval duration `yaml:"update-remote-interval"`
+
 	Ping struct {
 		Interval duration `yaml:"interval"`
 		Timeout  duration `yaml:"timeout"`
